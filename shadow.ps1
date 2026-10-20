@@ -167,42 +167,97 @@ $container.Controls.Add($spacer)
 $dlgForm.Controls.Add($container)
 
 
+# Session enumeration through the WTS API. Parsing qwinsta output depends on the
+# Windows UI language (state names are localized: Active/Disc vs ?????,????????/?"?????? ...).
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public class WtsSession
+{
+    public int Id;
+    public string Name;
+    public string User;
+    public string State;
+}
+
+public static class WtsApi
+{
+    [StructLayout(LayoutKind.Sequential)]
+    struct WTS_SESSION_INFO
+    {
+        public int SessionId;
+        [MarshalAs(UnmanagedType.LPWStr)] public string WinStationName;
+        public int State;
+    }
+
+    [DllImport("wtsapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool WTSEnumerateSessions(IntPtr hServer, int reserved, int version, out IntPtr ppSessionInfo, out int pCount);
+
+    [DllImport("wtsapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool WTSQuerySessionInformation(IntPtr hServer, int sessionId, int infoClass, out IntPtr ppBuffer, out int pBytesReturned);
+
+    [DllImport("wtsapi32.dll")]
+    static extern void WTSFreeMemory(IntPtr pMemory);
+
+    const int WTSUserName = 5;
+
+    // Same labels qwinsta prints on an English system
+    static readonly string[] StateNames = { "Active", "Conn", "ConnQ", "Shadow", "Disc", "Idle", "Listen", "Reset", "Down", "Init" };
+
+    static string QueryString(int sessionId, int infoClass)
+    {
+        IntPtr buffer;
+        int bytes;
+        if (!WTSQuerySessionInformation(IntPtr.Zero, sessionId, infoClass, out buffer, out bytes)) return "";
+        try { return Marshal.PtrToStringUni(buffer) ?? ""; }
+        finally { WTSFreeMemory(buffer); }
+    }
+
+    public static List<WtsSession> GetSessions()
+    {
+        List<WtsSession> result = new List<WtsSession>();
+        IntPtr info;
+        int count;
+        if (!WTSEnumerateSessions(IntPtr.Zero, 0, 1, out info, out count)) return result;
+        try
+        {
+            int size = Marshal.SizeOf(typeof(WTS_SESSION_INFO));
+            for (int i = 0; i < count; i++)
+            {
+                WTS_SESSION_INFO si = (WTS_SESSION_INFO)Marshal.PtrToStructure(new IntPtr(info.ToInt64() + (long)i * size), typeof(WTS_SESSION_INFO));
+                WtsSession s = new WtsSession();
+                s.Id = si.SessionId;
+                s.Name = si.WinStationName ?? "";
+                s.User = QueryString(si.SessionId, WTSUserName);
+                s.State = (si.State >= 0 && si.State < StateNames.Length) ? StateNames[si.State] : si.State.ToString();
+                result.Add(s);
+            }
+        }
+        finally { WTSFreeMemory(info); }
+        return result;
+    }
+}
+"@
+
 # Function to refresh session list
 function Refresh-SessionList {
     $dlgList.Items.Clear()
 
-    $sessionData = $(qwinsta.exe | findstr /R "Active Disc") -replace "^[\s>]", "" -replace "\s+", "," | ConvertFrom-Csv -Header $Header
+    foreach ($session in [WtsApi]::GetSessions()) {
+        # Same filter as before (Active + Disc); session 0 is the non-interactive services session
+        if ($session.Id -eq 0) { continue }
+        if ($session.State -ne 'Active' -and $session.State -ne 'Disc') { continue }
 
-    foreach ($session in $sessionData) {
-        if (-not $session.SESSIONNAME -or -not $session.ID) { continue }
-
-        $sessionname = $session.SESSIONNAME
-        $username    = if ($session.USERNAME) { $session.USERNAME } else { "" }
-        $id          = $session.ID
-        $status      = if ($session.PSObject.Properties.Name -contains 'STATUS') { $session.STATUS } else { "" }
-
-        if ($null -eq $sessionname -or $sessionname -eq "") {
-            Write-Warning "Skipped session with empty SESSIONNAME"
-            continue
-        }
-
-        $dlgListItem = New-Object System.Windows.Forms.ListViewItem($sessionname)
-
-        if ($null -eq $dlgListItem.SubItems) {
-            Write-Warning "SubItems null, creating manually"
-            $dlgListItem.SubItems = New-Object System.Windows.Forms.ListViewItem+ListViewSubItemCollection($dlgListItem)
-        }
-
-        if ($null -eq $status) { $status = "" }
-
-        $dlgListItem.SubItems.Add($username) | Out-Null
-        $dlgListItem.SubItems.Add($id) | Out-Null
-        $dlgListItem.SubItems.Add($status) | Out-Null
+        $dlgListItem = New-Object System.Windows.Forms.ListViewItem([string]$session.Name)
+        $dlgListItem.SubItems.Add([string]$session.User) | Out-Null
+        $dlgListItem.SubItems.Add([string]$session.Id) | Out-Null
+        $dlgListItem.SubItems.Add([string]$session.State) | Out-Null
 
         $dlgList.Items.Add($dlgListItem) | Out-Null
     }
 }
-
 # Function to connect to a session
 function Connect-Session {
     param ($session_id)
